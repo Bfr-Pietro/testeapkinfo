@@ -1,0 +1,10 @@
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "io.github.bfr_pietro.twa",
+    "sha256_cert_fingerprints": [
+      "3A:26:12:DE:21:33:97:CF:80:48:E4:6D:CA:B0:91:55:16:94:44:2B:54:2D:DA:66:2E:B5:B9:C0:E0:23:BA:68"
+    ]
+  }
+}]
