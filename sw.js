@@ -1,14 +1,14 @@
 /* =====================================================
-   SERVICE WORKER — Terceiro INFO PWA
-   - Cache offline de todas as páginas/assets do app
-   - Notificações locais agendadas (disparadas mesmo offline)
-   - Sincronização de eventos do Firestore via postMessage
+   SERVICE WORKER — Terceiro INFO PWA  v2
+   - Cache offline
+   - Notification Triggers API: notificações agendadas
+     pelo sistema operacional — disparam com app fechado
+     e sem internet, pois são registradas no próprio SO.
    ===================================================== */
 
-const CACHE_NAME = 'terceiro-info-v1';
+const CACHE_NAME = 'terceiro-info-v2';
 const OFFLINE_URL = './index.html';
 
-/* Assets que sempre ficam em cache */
 const PRECACHE_ASSETS = [
   './index.html',
   './manifest.json',
@@ -18,83 +18,58 @@ const PRECACHE_ASSETS = [
   'https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js'
 ];
 
-/* ── INSTALL: pré-cacheia assets essenciais ── */
 self.addEventListener('install', event => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then(cache => {
-      return cache.addAll(PRECACHE_ASSETS).catch(() => {
-        // Falha silenciosa em assets externos (fontes etc.)
-      });
-    }).then(() => self.skipWaiting())
+    caches.open(CACHE_NAME)
+      .then(cache => cache.addAll(PRECACHE_ASSETS).catch(() => {}))
+      .then(() => self.skipWaiting())
   );
 });
 
-/* ── ACTIVATE: remove caches antigos ── */
 self.addEventListener('activate', event => {
   event.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
-    ).then(() => self.clients.claim())
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+      .then(() => rescheduleAll())
   );
 });
 
-/* ── FETCH: Estratégia Network-first com fallback para cache ── */
 self.addEventListener('fetch', event => {
   const req = event.request;
-
-  // Ignora requisições não-GET e extensões do Chrome
   if (req.method !== 'GET') return;
   if (req.url.startsWith('chrome-extension')) return;
-
-  // Requisições ao Firebase/Firestore: deixa passar normalmente
   if (req.url.includes('firestore.googleapis.com') ||
       req.url.includes('firebase') ||
-      req.url.includes('googleapis.com/identitytoolkit')) {
-    return;
-  }
+      req.url.includes('googleapis.com/identitytoolkit')) return;
 
   event.respondWith(
     fetch(req)
       .then(response => {
-        // Cacheia resposta bem-sucedida (apenas mesma origem + CDNs conhecidos)
         if (response && response.status === 200) {
           const url = req.url;
-          const shouldCache =
-            url.startsWith(self.location.origin) ||
-            url.includes('fonts.googleapis.com') ||
-            url.includes('fonts.gstatic.com') ||
-            url.includes('gstatic.com/firebasejs');
-
-          if (shouldCache) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then(cache => cache.put(req, clone));
+          if (url.startsWith(self.location.origin) ||
+              url.includes('fonts.googleapis.com') ||
+              url.includes('fonts.gstatic.com') ||
+              url.includes('gstatic.com/firebasejs')) {
+            caches.open(CACHE_NAME).then(cache => cache.put(req, response.clone()));
           }
         }
         return response;
       })
-      .catch(() => {
-        // Offline: tenta servir do cache
-        return caches.match(req).then(cached => {
+      .catch(() =>
+        caches.match(req).then(cached => {
           if (cached) return cached;
-
-          // Se for navegação (HTML), retorna o app offline
-          if (req.destination === 'document') {
-            return caches.match(OFFLINE_URL);
-          }
-
-          // Para imagens externas (imgur, etc): retorna SVG de aviso offline
+          if (req.destination === 'document') return caches.match(OFFLINE_URL);
           if (req.destination === 'image') {
-            return new Response(OFFLINE_IMAGE_SVG, {
-              headers: { 'Content-Type': 'image/svg+xml' }
-            });
+            return new Response(OFFLINE_SVG, { headers: { 'Content-Type': 'image/svg+xml' } });
           }
-        });
-      })
+        })
+      )
   );
 });
 
-/* ── SVG mostrado no lugar de imagens quando offline ── */
-const OFFLINE_IMAGE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="300" viewBox="0 0 480 300">
+const OFFLINE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="300" viewBox="0 0 480 300">
   <rect width="480" height="300" fill="#111118" rx="8"/>
   <text x="240" y="120" text-anchor="middle" font-family="sans-serif" font-size="40" fill="#5c2d91">📵</text>
   <text x="240" y="168" text-anchor="middle" font-family="sans-serif" font-size="15" font-weight="bold" fill="#eeeef8">Você está offline!</text>
@@ -103,143 +78,160 @@ const OFFLINE_IMAGE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="480" h
 </svg>`;
 
 /* =====================================================
-   SISTEMA DE NOTIFICAÇÕES LOCAIS AGENDADAS
-   =====================================================
-   O app envia eventos ao SW via postMessage.
-   O SW armazena no IndexedDB e usa um alarme periódico
-   (via setInterval ao ser ativado) para checar e disparar.
-*/
+   NOTIFICATION TRIGGERS API
+   O TimestampTrigger registra a notificação diretamente
+   no sistema operacional Android. Ela dispara na hora
+   certa mesmo com app fechado e sem internet.
+   Fallback via setInterval para browsers sem suporte.
+===================================================== */
 
-/* ── Banco simples em memória (persistido via IndexedDB) ── */
-let scheduledNotifications = [];
-
-/* ── Abre/cria IndexedDB ── */
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('terceiro-info-notif', 1);
+    const req = indexedDB.open('terceiro-info-notif', 2);
     req.onupgradeneeded = e => {
       const db = e.target.result;
-      if (!db.objectStoreNames.contains('notifications')) {
+      if (!db.objectStoreNames.contains('notifications'))
         db.createObjectStore('notifications', { keyPath: 'id' });
-      }
     };
     req.onsuccess = e => resolve(e.target.result);
-    req.onerror = e => reject(e.target.error);
+    req.onerror = () => reject();
   });
 }
 
-async function getAllNotifications() {
+async function dbGetAll() {
   const db = await openDB();
-  return new Promise((resolve, reject) => {
+  return new Promise(resolve => {
     const tx = db.transaction('notifications', 'readonly');
-    const store = tx.objectStore('notifications');
-    const req = store.getAll();
+    const req = tx.objectStore('notifications').getAll();
     req.onsuccess = () => resolve(req.result || []);
     req.onerror = () => resolve([]);
   });
 }
 
-async function saveNotification(notif) {
+async function dbPut(item) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction('notifications', 'readwrite');
-    const store = tx.objectStore('notifications');
-    store.put(notif);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject();
+    tx.objectStore('notifications').put(item);
+    tx.oncomplete = resolve;
+    tx.onerror = reject;
   });
 }
 
-async function deleteNotification(id) {
+async function dbDelete(id) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction('notifications', 'readwrite');
-    const store = tx.objectStore('notifications');
-    store.delete(id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject();
+    tx.objectStore('notifications').delete(id);
+    tx.oncomplete = resolve;
+    tx.onerror = reject;
   });
 }
 
-async function clearAllNotifications() {
+async function dbClear() {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction('notifications', 'readwrite');
-    const store = tx.objectStore('notifications');
-    store.clear();
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject();
+    tx.objectStore('notifications').clear();
+    tx.oncomplete = resolve;
+    tx.onerror = reject;
   });
 }
 
-/* ── Verifica e dispara notificações pendentes ── */
-async function checkAndFireNotifications() {
-  const now = Date.now();
-  const all = await getAllNotifications();
+async function scheduleWithTrigger(notif) {
+  if (notif.fireAt <= Date.now()) return false;
+  try {
+    await self.registration.showNotification(notif.title, {
+      body: notif.body,
+      icon: 'https://i.imgur.com/7sHCoxx.png',
+      badge: 'https://i.imgur.com/7sHCoxx.png',
+      tag: 'notif-' + notif.id,
+      data: { notifId: notif.id, eventId: notif.eventId || null },
+      showTrigger: new TimestampTrigger(notif.fireAt),
+      vibrate: [200, 100, 200],
+      requireInteraction: false
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 
+async function cancelTrigger(notifId) {
+  try {
+    const list = await self.registration.getNotifications({ includeTriggered: true });
+    list.filter(n => n.tag === 'notif-' + notifId).forEach(n => n.close());
+  } catch (e) {}
+}
+
+async function rescheduleAll() {
+  const all = await dbGetAll();
   for (const notif of all) {
-    // Notificações com fireAt no passado (até 10 minutos atrás) ou agora
-    if (notif.fireAt <= now && notif.fireAt > now - 10 * 60 * 1000) {
-      await self.registration.showNotification(notif.title, {
-        body: notif.body,
-        icon: 'https://i.imgur.com/7sHCoxx.png',
-        badge: 'https://i.imgur.com/7sHCoxx.png',
-        tag: notif.id,
-        data: { eventId: notif.eventId },
-        vibrate: [200, 100, 200],
-        requireInteraction: false
-      });
-      // Remove após disparar
-      await deleteNotification(notif.id);
+    if (notif.fireAt > Date.now()) {
+      const ok = await scheduleWithTrigger(notif);
+      if (!ok) return; // sem suporte — usa fallback
     }
   }
 }
 
-/* Inicia verificação periódica a cada 1 minuto */
-setInterval(checkAndFireNotifications, 60 * 1000);
-// Verifica imediatamente ao ativar
-checkAndFireNotifications();
+/* Fallback para browsers sem TimestampTrigger */
+async function checkFallback() {
+  const now = Date.now();
+  const all = await dbGetAll();
+  for (const notif of all) {
+    if (notif.fireAt <= now && notif.fireAt > now - 10 * 60 * 1000) {
+      try {
+        await self.registration.showNotification(notif.title, {
+          body: notif.body,
+          icon: 'https://i.imgur.com/7sHCoxx.png',
+          badge: 'https://i.imgur.com/7sHCoxx.png',
+          tag: 'notif-' + notif.id,
+          vibrate: [200, 100, 200]
+        });
+      } catch (e) {}
+      await dbDelete(notif.id);
+    }
+  }
+}
+setInterval(checkFallback, 60 * 1000);
+checkFallback();
 
-/* ── Recebe mensagens do app principal ── */
 self.addEventListener('message', async event => {
   const { type, payload } = event.data || {};
+  const reply = msg => event.source && event.source.postMessage(msg);
 
   switch (type) {
-
-    /* Recebe lista completa de notificações agendadas */
     case 'SCHEDULE_NOTIFICATIONS':
-      await clearAllNotifications();
+      await dbClear();
+      const prev = await self.registration.getNotifications({ includeTriggered: true }).catch(() => []);
+      prev.forEach(n => n.close());
       if (Array.isArray(payload)) {
-        for (const n of payload) {
-          await saveNotification(n);
-        }
+        for (const n of payload) { await dbPut(n); await scheduleWithTrigger(n); }
       }
-      event.source && event.source.postMessage({ type: 'SCHEDULE_OK', count: payload?.length || 0 });
+      reply({ type: 'SCHEDULE_OK', count: payload?.length || 0 });
       break;
 
-    /* Adiciona ou atualiza uma notificação */
     case 'UPSERT_NOTIFICATION':
       if (payload) {
-        await saveNotification(payload);
-        event.source && event.source.postMessage({ type: 'UPSERT_OK', id: payload.id });
+        await cancelTrigger(payload.id);
+        await dbPut(payload);
+        await scheduleWithTrigger(payload);
+        reply({ type: 'UPSERT_OK', id: payload.id });
       }
       break;
 
-    /* Remove uma notificação pelo id */
     case 'DELETE_NOTIFICATION':
       if (payload?.id) {
-        await deleteNotification(payload.id);
-        event.source && event.source.postMessage({ type: 'DELETE_OK', id: payload.id });
+        await cancelTrigger(payload.id);
+        await dbDelete(payload.id);
+        reply({ type: 'DELETE_OK', id: payload.id });
       }
       break;
 
-    /* Retorna lista atual de notificações */
     case 'GET_NOTIFICATIONS':
-      const all = await getAllNotifications();
-      event.source && event.source.postMessage({ type: 'NOTIFICATIONS_LIST', data: all });
+      reply({ type: 'NOTIFICATIONS_LIST', data: await dbGetAll() });
       break;
 
-    /* Teste imediato */
     case 'TEST_NOTIFICATION':
       await self.registration.showNotification('🔔 Terceiro INFO', {
         body: 'Notificações funcionando! Você receberá avisos dos eventos.',
@@ -248,17 +240,20 @@ self.addEventListener('message', async event => {
         vibrate: [200, 100, 200]
       });
       break;
+
+    case 'CHECK_TRIGGER_SUPPORT':
+      let supported = false;
+      try { supported = typeof TimestampTrigger !== 'undefined'; } catch(e) {}
+      reply({ type: 'TRIGGER_SUPPORT', supported });
+      break;
   }
 });
 
-/* ── Clique na notificação: abre o app ── */
 self.addEventListener('notificationclick', event => {
   event.notification.close();
   event.waitUntil(
-    clients.matchAll({ type: 'window', includeUncontrolled: true }).then(windowClients => {
-      for (const client of windowClients) {
-        if ('focus' in client) return client.focus();
-      }
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+      for (const c of list) if ('focus' in c) return c.focus();
       return clients.openWindow('./index.html');
     })
   );
